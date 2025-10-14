@@ -1,0 +1,24 @@
+{
+  "task_id": "623ea044",
+  "split": "training",
+  "candidates": [
+    {
+      "instructions": "1. Identify the target value (7 or 2 or 8) in the INPUT grid.\n2. Create a square shape around the target value, with the target value at its center.\n3. The square shape should have a size of 3x3.\n4. The target value should be at the center of the square, and the remaining cells in the square should be filled with zeros.\n5. If the target value is at the edge of the grid, the square shape should be truncated to fit within the grid boundaries.\n6. The resulting square shape is then mirrored across the center of the grid, with the target value at the center of the mirrored square.\n7. The mirrored square is then resized to fit the entire grid, while maintaining its shape and orientation.\n8. The resulting grid is the OUTPUT grid."
+    },
+    {
+      "instructions": "1. Identify the target value (7 or 2 or 8) in the INPUT grid.\n2. Create a new grid with the same dimensions as the INPUT grid.\n3. Starting from the center of the grid, move diagonally up-left and down-right (at a 45-degree angle) until you reach the edge of the grid.\n4. Place the target value at each point you visit in step 3.\n5. Fill in the remaining cells with zeros."
+    },
+    {
+      "instructions": "1. Identify the target value (7 or 2 or 8) in the INPUT grid.\n2. Create a square or rectangle around the target value, including the target value itself.\n3. The square or rectangle's top-left corner is the target value's position.\n4. The square or rectangle's size is 3x3 or 5x5, depending on the target value's position.\n5. Fill the square or rectangle with the target value, repeating it in a checkerboard pattern.\n6. If the target value is on the grid's edge, extend the square or rectangle to the edge, filling the new cells with the target value.\n7. If the target value is in the grid's corner, extend the square or rectangle to the corner, filling the new cells with the target value.\n8. The resulting square or rectangle is the OUTPUT grid."
+    },
+    {
+      "instructions": "1. Identify the target value (in this case, 7 and 2) in the INPUT grid.\n2. Create a square shape centered around the target value, with the target value at its center.\n3. The square shape's side length is equal to the distance from the target value to the nearest edge of the grid.\n4. Fill the square shape with the target value.\n5. Remove the target value from the original grid.\n6. Place the filled square shape at the position of the removed target value.\n7. Repeat steps 4-6 until all target values have been processed."
+    },
+    {
+      "instructions": "1. Identify the target value (7 or 2 or 8) in the INPUT grid.\n2. Create a square or rectangle around the target value, with the side length equal to the distance from the target value to the nearest edge of the grid.\n3. The target value will be placed at the center of this square or rectangle in the OUTPUT grid.\n4. The remaining cells in the square or rectangle will be filled with the target value.\n5. The cells outside the square or rectangle will remain unchanged."
+    },
+    {
+      "instructions": "1. Identify the target value (in this case, 7 and 2) in the INPUT grid.\n2. Create a new grid with the same dimensions as the INPUT grid.\n3. Starting from the center of the grid, move diagonally up and to the right (in a 45-degree angle) until you reach the edge of the grid.\n4. Place the target value at each position you visit during this diagonal movement.\n5. Fill in the remaining positions in the grid with zeros."
+    }
+  ]
+}

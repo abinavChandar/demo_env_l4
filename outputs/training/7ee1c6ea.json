@@ -1,0 +1,24 @@
+{
+  "task_id": "7ee1c6ea",
+  "split": "training",
+  "candidates": [
+    {
+      "instructions": "1. Identify and isolate the central element in each grid.\n2. Rotate the entire grid 90 degrees clockwise around the central element.\n3. The central element remains unchanged, while all other elements move accordingly."
+    },
+    {
+      "instructions": "Based on the given training pairs, the transformation rule can be inferred as follows:\n\n1. The grid remains unchanged in terms of size and shape.\n2. The numbers in the grid are shifted by one position to the right, wrapping around to the leftmost column when reaching the rightmost column.\n3. The numbers in the grid are also shifted by one position down, wrapping around to the top row when reaching the bottom row.\n4. The numbers in the grid are mirrored horizontally, but only for the middle row (second row from the top and second row from the bottom).\n5. The numbers in the grid are mirrored vertically, but only for the middle column (second column from the left and second column from the right).\n6. The numbers in the grid are not changed in terms of color or value."
+    },
+    {
+      "instructions": "1. Identify the center cell in the INPUT grid.\n2. If the center cell is not zero, rotate the entire grid 90 degrees clockwise.\n3. Replace all non-zero cells with the value of the cell directly above them.\n4. Replace all zero cells with the value of the cell directly above them if it is not zero, otherwise, replace it with the value of the cell directly to its left."
+    },
+    {
+      "instructions": "1. Identify the center cell in each row of the INPUT grid.\n2. If the center cell is not empty, replace it with the value of the cell to its right.\n3. If the cell to the right of the center cell is empty, replace it with the value of the cell to its left.\n4. If the cell to the left of the center cell is empty, replace it with the value of the cell to its left, but only if the cell to the left of the left cell is not empty.\n5. Repeat steps 2-4 for each row in the INPUT grid."
+    },
+    {
+      "instructions": "1. Identify the top-left and bottom-right cells of the grid that contain a non-zero value.\n2. Swap the values of these two cells.\n3. Leave all other cells unchanged."
+    },
+    {
+      "instructions": "1. Identify the center cell in the INPUT grid.\n2. If the center cell is not empty, swap its value with the value of the cell diagonally opposite to it (top-left to bottom-right).\n3. If the center cell is empty, do nothing.\n4. Repeat steps 1-3 for all training pairs."
+    }
+  ]
+}

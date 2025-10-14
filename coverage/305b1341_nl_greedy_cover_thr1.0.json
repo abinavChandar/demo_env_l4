@@ -1,0 +1,30 @@
+{
+  "chosen_order": [
+    "pair_index"
+  ],
+  "info": {
+    "covered_pairs": [
+      "0",
+      "1",
+      "2",
+      "3",
+      "4",
+      "5"
+    ],
+    "uncovered_pairs": [],
+    "steps": [
+      {
+        "chosen": "pair_index",
+        "newly_covered": [
+          "0",
+          "1",
+          "2",
+          "3",
+          "4",
+          "5"
+        ],
+        "remaining_uncovered": 0
+      }
+    ]
+  }
+}

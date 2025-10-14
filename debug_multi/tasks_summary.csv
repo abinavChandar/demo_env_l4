@@ -1,0 +1,6 @@
+task_id,num_pairs,num_candidates,best_candidate_index,best_mean_acc,solved,wall_time_sec
+305b1341,3,6,3,34.6667,0,108.785
+5833af48,3,6,4,43.8059,0,112.842
+623ea044,3,6,1,87.1232,0,62.427
+7ee1c6ea,3,6,5,78.0,0,35.324
+ce9e57f2,3,6,3,87.4853,0,30.691

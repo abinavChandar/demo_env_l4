@@ -1,0 +1,7 @@
+nl_set_id,mean_acc,exact_pass_rate,pairs_covered,pairs_total
+pair_index,0.6666666666666666,0.6666666666666666,6.0,6
+cell_accuracy,0.3888888888888889,0.3888888888888889,4.0,6
+input,0.0,0.0,0.0,6
+note,0.0,0.0,0.0,6
+pred,0.0,0.0,0.0,6
+target,0.0,0.0,0.0,6

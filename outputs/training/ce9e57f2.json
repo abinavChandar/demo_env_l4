@@ -1,0 +1,24 @@
+{
+  "task_id": "ce9e57f2",
+  "split": "training",
+  "candidates": [
+    {
+      "instructions": "1. Identify the top and bottom edges of the grid with a value of 2.\n2. For each row above the bottom edge and below the top edge, replace the value 2 with the value of the cell directly below it.\n3. For each row above the top edge, replace the value 2 with 0.\n4. For each row below the bottom edge, replace the value 2 with the value of the cell directly above it.\n5. Replace all values of 2 with 8 in the bottom row.\n6. Replace all values of 2 with 8 in the row above the bottom row, where the row above the bottom row has a value of 8 in the cell directly above the bottom row's cell with a value of 8.\n7. Replace all values of 2 with 0 in the top row."
+    },
+    {
+      "instructions": "1. Identify the top and bottom rows of the grid as the \"border\" and the middle rows as the \"interior\".\n2. In the interior, find the first row that contains a non-zero value.\n3. In the interior, find the last row that contains a non-zero value.\n4. In the interior, find the first column that contains a non-zero value.\n5. In the interior, find the last column that contains a non-zero value.\n6. For each cell in the interior, if it is within the top-left rectangle defined by the border and the top-left corner of the first non-zero row and column, set its value to 0.\n7. For each cell in the interior, if it is within the bottom-right rectangle defined by the border and the bottom-right corner of the last non-zero row and column, set its value to 8.\n8. For each cell in the interior, if it is not within either of the rectangles defined in steps 6 and 7, set its value to the value of the cell in the corresponding position in the input grid."
+    },
+    {
+      "instructions": "1. Identify the top and bottom rows of the grid as the \"border\" and fill them with zeros.\n2. Identify the second row from the top and the second row from the bottom as the \"middle border\" and fill them with zeros.\n3. Identify the cells that are two rows away from the top and bottom borders and two columns away from the left and right borders as the \"inner cells\".\n4. For each inner cell, if it is surrounded by exactly four cells with a value of 2, replace its value with 8.\n5. For each inner cell, if it is surrounded by exactly three cells with a value of 2, replace its value with 2.\n6. For each inner cell, if it is surrounded by exactly two cells with a value of 2, replace its value with 2.\n7. For each inner cell, if it is surrounded by exactly one cell with a value of 2, replace its value with 2.\n8. For each inner cell, if it is not surrounded by any cells with a value of 2, replace its value with 0."
+    },
+    {
+      "instructions": "1. Identify the central column in the INPUT grid.\n2. If the cell in the central column is not zero, replace the cell in the same row and column in the OUTPUT grid with the value from the cell two positions to the right in the INPUT grid.\n3. If the cell in the central column is zero, replace the cell in the same row and column in the OUTPUT grid with the value from the cell in the same column in the INPUT grid.\n4. If the cell in the row above the central column is not zero, replace the cell in the same column in the OUTPUT grid with the value from the cell in the same column in the INPUT grid.\n5. If the cell in the row above the central column is zero, replace the cell in the same column in the OUTPUT grid with the value from the cell in the column to the left of the central column in the INPUT grid.\n6. Repeat steps 2-5 for each row in the INPUT grid."
+    },
+    {
+      "instructions": "1. Identify the top and bottom rows of the INPUT grid as the \"border\" and the middle rows as the \"interior\".\n2. In the interior, for each cell with value 2, check if it has a neighbor with value 2 in the same column.\n3. If a cell in the interior has a neighbor with value 2 in the same column, replace its value with the value of the cell above it.\n4. If a cell in the interior does not have a neighbor with value 2 in the same column, replace its value with 8.\n5. The border remains unchanged."
+    },
+    {
+      "instructions": "1. Identify the top and bottom borders of the grid, which are rows with a value of 2.\n2. For each row, find the first and last columns with a value of 2.\n3. For each row, find the middle column (or the column with the most 2s if there are multiple).\n4. In the OUTPUT grid, replace all values of 2 in the middle column with 8, and replace all values of 2 in the first and last columns with 0.\n5. Replace all values of 2 in the top and bottom borders with 0 in the OUTPUT grid.\n6. Replace all values of 8 in the OUTPUT grid with 2, except for the middle column.\n7. Replace all values of 0 in the OUTPUT grid with 2, except for the top and bottom borders and the middle column."
+    }
+  ]
+}
