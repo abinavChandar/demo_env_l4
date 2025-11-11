@@ -1,499 +1,607 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Raw-Python ARC transform generator (robust, self-healing).
+from __future__ import annotations
 
-Key features:
-- Accepts NL instruction candidates JSON (and optional ARC IO pairs for reference).
-- Prompts for code-only; enforces exact header/signature.
-- Auto-coerces model output into a valid file if header/signature missing.
-- Allows only a small dsl_* op subset; static checks + one auto-repair pass.
-- Endpoint fallback: tries /v1/chat/completions, then /v1/completions.
-- Auto-resolves model id from /v1/models (or /models) when possible.
-- Parallel generation via ThreadPoolExecutor.
+import argparse, ast, glob, json, os, re, sys, time, uuid, random, threading, inspect, importlib
+from typing import Any, Dict, List, Optional, Tuple, Set
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests
 
-Expected input JSON shapes:
-  { "candidates":[{"instructions":"..."}, ...], "train":[{"input":...,"output":...}, ...] }
-  [{"instructions":"..."}, ...]
-  { "instructions":"..." }
-"""
+# ------------------------ logging & telemetry ------------------------
 
-import argparse, os, sys, json, re, ast, traceback, concurrent.futures as cf
-from typing import Any, Dict, List, Optional
+def log(level: str, msg: str):
+    print(f"[{level}] {msg}", flush=True)
 
-# ============================ Constants & Config ============================
+class Telemetry:
+    def __init__(self, scores_root: str, emit_events: bool):
+        self.start_ts = time.time()
+        self.run_id = f"nlgen_all_par_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        self.emit_events = emit_events
+        self.root_dir = os.path.join(scores_root, "telemetry")
+        os.makedirs(self.root_dir, exist_ok=True)
+        self.summary_path = os.path.join(self.root_dir, f"{self.run_id}.summary.json")
+        self.events_path  = os.path.join(self.root_dir, f"{self.run_id}.events.jsonl")
+        self.events_lock = threading.Lock()
+        if self.emit_events:
+            open(self.events_path, "w").close()
+        self.rollup = {
+            "run_id": self.run_id,
+            "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(self.start_ts)),
+            "dur_seconds": None,
+            "scores_root": scores_root,
+            "task_id": None,
+            "candidates_total": 0,
+            "candidates_ok": 0,
+            "candidates_err": 0,
+            "api_base": None,
+            "model": None,
+            "temperature": None,
+            "max_tokens": None,
+            "workers": None,
+            "notes": [],
+        }
 
-HEADER = (
-    "from typing import List\n"
-    "import dsl_primitives as dsl\n\n"
-)
-SIG_LINE = "def transform(grid: List[List[int]]) -> List[List[int]]:"
+    def event(self, kind: str, **payload):
+        if not self.emit_events: return
+        rec = {"ts": time.time(), "run_id": self.run_id, "kind": kind, **payload}
+        with self.events_lock:
+            with open(self.events_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec) + "\n")
 
-HEADER_SNIPPET = (
-    HEADER +
-    SIG_LINE + "\n"
-    "    # write solution below\n"
-    "    G = dsl.dsl_clone(grid)\n"
-    "    return G\n"
-)
+    def end(self):
+        self.rollup["dur_seconds"] = round(time.time() - self.start_ts, 6)
+        with open(self.summary_path, "w", encoding="utf-8") as f:
+            json.dump(self.rollup, f, indent=2)
 
-DEFAULT_ALLOWED_OPS = [
-    # utils / shape
-    "dsl_shape", "dsl_clone", "dsl_clamp", "dsl_zeros_like", "dsl_full", "dsl_in_bounds",
-    # accessors
-    "dsl_get_cell", "dsl_set_cell", "dsl_paint_cell",
-    # colors
-    "dsl_replace_color", "dsl_remap_colors",
-    # rows/cols
-    "dsl_paint_row", "dsl_paint_col", "dsl_copy_row", "dsl_copy_col",
-    # geometry
-    "dsl_flip_h", "dsl_flip_v", "dsl_transpose", "dsl_rot90",
-    # regions
-    "dsl_fill_rect", "dsl_paste", "dsl_paste_masked", "dsl_crop",
-    # masks
-    "dsl_mask_eq", "dsl_apply_mask_color", "dsl_dilate", "dsl_erode",
-    # connected components
-    "dsl_neighbors4", "dsl_flood_fill", "dsl_component_mask", "dsl_bbox_of_mask",
-    # composition
-    "dsl_copy_cell_from", "dsl_write_component",
-]
+# ------------------------ constants ------------------------
 
-STOP_SEQUENCES = ["```", "</code>", "###", "```python"]
+INSTR_COLS_JSON = ["instructions","instruction","instructions_text","text","plan","nl"]
+CAND_ID_COLS_JSON = ["candidate_index","candidate_idx","cand_idx","cand_index","index","idx","id","candidate_id","cand_id"]
 
-FORBIDDEN_PATTERNS = [
-    r"^\s*import\s+(?!dsl_primitives\b)",  # no extra imports (only allowed header)
-    r"\bopen\s*\(",
-    r"\bprint\s*\(",
-    r"\bos\.|subprocess|socket|sys\.stdin|sys\.stdout|random\b|torch\b|numpy\b",
-]
+SAFE_BUILTIN_CALLS: Set[str] = {
+    "range","len","enumerate","list","tuple","int","max","min","sum","any","all","zip"
+}
 
-SIGNATURE_RE = re.compile(
-    r"from\s+typing\s+import\s+List\s*[\r\n]+"
-    r"import\s+dsl_primitives\s+as\s+dsl\s*[\r\n]+"
-    r"def\s+transform\s*\(\s*grid\s*:\s*List\s*\[\s*List\s*\[\s*int\s*\]\s*\]\s*\)"
-    r"\s*->\s*List\s*\[\s*List\s*\[\s*int\s*\]\s*\]\s*:",
-    re.IGNORECASE | re.MULTILINE
-)
+# ------------------------ helpers: parsing candidates ------------------------
 
-# ============================ Extractors ============================
+def split_lines(s: str) -> List[str]:
+    parts = re.split(r"[\n;]+", s)
+    out: List[str] = []
+    for p in parts:
+        p = re.sub(r"^\s*[\-\*\d\.\)\(]+\s*", "", p.strip())
+        if p: out.append(p)
+    return out
 
-def extract_nl_candidates(obj: Any) -> List[str]:
-    """NL candidates:
-       - {"candidates":[{"instructions":"..."} , ...]}
-       - [{"instructions":"..."}, ...]
-       - {"instructions":"..."}  (single)
-    """
-    if obj is None:
-        return []
-    if isinstance(obj, dict):
-        if "candidates" in obj and isinstance(obj["candidates"], list):
-            return [x.get("instructions", "") for x in obj["candidates"] if isinstance(x, dict)]
-        if isinstance(obj.get("instructions"), str):
-            return [obj["instructions"]]
-    if isinstance(obj, list):
-        out = []
-        for x in obj:
-            if isinstance(x, dict) and isinstance(x.get("instructions"), str):
-                out.append(x["instructions"])
+def normalize_instructions(val: Any) -> List[str]:
+    if val is None: return []
+    if isinstance(val, list):
+        out: List[str] = []
+        for x in val:
+            if x is None: continue
+            s = str(x).strip()
+            if not s: continue
+            out.extend(split_lines(s))
         return out
-    return []
-
-def extract_io_pairs(obj: Any) -> List[Dict[str, Any]]:
-    """ARC IO pairs for reference (optional):
-       - {"train":[{"input":..,"output":..}, ...]}
-       - {"io_pairs":[...]} or {"pairs":[...]} or {"examples":[...]}
-       - direct list of {"input","output"}
-    """
-    if obj is None:
-        return []
-    if isinstance(obj, dict):
-        for key in ("io_pairs", "pairs", "examples"):
-            if isinstance(obj.get(key), list):
-                return obj[key]
-        if isinstance(obj.get("train"), list):
-            res = []
-            for ex in obj["train"]:
-                if isinstance(ex, dict) and "input" in ex and "output" in ex:
-                    res.append({"input": ex["input"], "output": ex["output"]})
-            return res
-    if isinstance(obj, list) and obj and isinstance(obj[0], dict) and \
-       ("input" in obj[0] and "output" in obj[0]):
-        return obj
-    return []
-
-# ============================ Prompt Builders ============================
-
-def build_system_prompt() -> str:
-    return (
-        "You write Python for ARC grid transforms using a tiny DSL already imported as `dsl`.\n"
-        "Output ONLY one Python file with EXACTLY this header and a single function.\n"
-        "No prose, no markdown, no extra text — code only.\n"
-    )
-
-def build_user_prompt(nl_text: str,
-                      io_pairs: List[Dict[str, Any]],
-                      allowed_ops: List[str]) -> str:
-    parts = []
-    parts.append("Output ONLY the code between <BEGIN_FILE> and <END_FILE>. No prose.")
-    parts.append("Your file MUST start exactly with this header+signature:")
-    parts.append("<HEADER>\n" + HEADER + SIG_LINE + "\n    # write solution below\n</HEADER>")
-    parts.append("Allowed ops subset (use only these): " + ", ".join(allowed_ops))
-    parts.append("Task instructions:\n" + nl_text.strip())
-    if io_pairs:
-        parts.append("# reference_examples = " + json.dumps(io_pairs[:2], ensure_ascii=False))
-    # Provide a scaffold they can overwrite:
-    parts.append("<BEGIN_FILE>\n" + HEADER_SNIPPET + "\n<END_FILE>")
-    return "\n\n".join(parts)
-
-def build_repair_prompt(code: str, error: str) -> str:
-    return (
-        "Your previous code failed to compile or run. Fix it WITHOUT changing the header imports or the function name.\n"
-        "Keep ONLY the single function in the file. Output ONLY the corrected code (no prose).\n\n"
-        "<BEGIN_PREVIOUS_CODE>\n" + code + "\n<END_PREVIOUS_CODE>\n\n"
-        "Error (first lines):\n" + error.strip() + "\n\n"
-        "Re-output the FULL corrected file, code ONLY, starting with the required header."
-    )
-
-# ============================ Coercion & Checks ============================
-
-def extract_code(text: str) -> str:
-    """Strip markdown fences if present; otherwise return raw text."""
-    fence = re.search(r"```(?:python)?\s*([\s\S]*?)```", text, re.IGNORECASE)
-    if fence:
-        return fence.group(1).strip()
-    # If <BEGIN_FILE> guard is present, use it
-    g = re.search(r"<BEGIN_FILE>\s*([\s\S]*?)\s*<END_FILE>", text, re.IGNORECASE)
-    if g:
-        return g.group(1).strip()
-    return text.strip()
-
-def _extract_body_or_return(code: str) -> str:
-    """Try to pull the body of transform() from arbitrary text/code."""
-    # 1) fenced code
-    m = re.search(r"```(?:python)?\s*([\s\S]*?)```", code, re.IGNORECASE)
-    if m:
-        code = m.group(1)
-    # 2) find 'def transform(...):' and capture its block
-    m = re.search(r"def\s+transform\s*\([^)]*\)\s*:\s*([\s\S]*)", code)
-    if not m:
-        return ""
-    body = m.group(1)
-    lines = body.splitlines()
-    if not lines or all(not ln.strip() for ln in lines):
-        return "    pass\n"
-    # If first content line is not indented, indent best-effort
-    if lines and lines[0] and not lines[0].startswith((" ", "\t")):
-        lines = ["    " + ln for ln in lines]
-    return "\n".join(lines).rstrip() + ("\n" if not body.endswith("\n") else "")
-
-def coerce_to_valid_file(text: str) -> str:
-    """Guarantee header+signature; wrap extracted body or a safe stub."""
-    code = extract_code(text)
-    if "from typing import List" in code and "import dsl_primitives as dsl" in code and "def transform(" in code:
-        return code.strip()
-    body = _extract_body_or_return(code)
-    if not body:
-        body = "    G = dsl.dsl_clone(grid)\n    return G\n"
-    if "return " not in body:
-        body = "    G = dsl.dsl_clone(grid)\n" + body + "\n    return G\n"
-    return f"{HEADER}{SIG_LINE}\n{body}"
-
-def static_checks(code: str, allowed_ops: List[str]) -> Optional[str]:
-    """Return None if ok, else error string describing the violation."""
-    if not SIGNATURE_RE.search(code):
-        return "Missing or incorrect header/signature."
-    for pat in FORBIDDEN_PATTERNS:
-        if re.search(pat, code):
-            return f"Forbidden pattern matched: {pat}"
-    calls = re.findall(r"\bdsl\.(\w+)\s*\(", code)
-    for c in calls:
-        if not c.startswith("dsl_"):
-            return f"Non-DSL call detected: {c}"
-        if c not in allowed_ops:
-            return f"Call to disallowed op: dsl.{c}"
-    try:
-        ast.parse(code)
-    except SyntaxError as e:
-        return f"SyntaxError: {e}"
-    return None
-
-def runtime_smoke(code_path: str) -> Optional[str]:
-    """Import the produced module and run a minimal smoke test."""
-    try:
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("transform_module", code_path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)  # type: ignore
-        if not hasattr(mod, "transform"):
-            return "No transform() defined after import."
-        out = mod.transform([[0]])
-        if not isinstance(out, list) or (out and not isinstance(out[0], list)):
-            return "transform did not return List[List[int]]"
-        return None
-    except Exception as e:
-        tb = "".join(traceback.format_exception_only(type(e), e)).strip()
-        return f"Runtime import/run error: {tb}"
-
-# ============================ HTTP & Model Resolve ============================
-
-def list_models(api_base: str, timeout=(5.0, 10.0)) -> list:
-    import requests
-    urls = [f"{api_base.rstrip('/')}/v1/models", f"{api_base.rstrip('/')}/models"]
-    for url in urls:
+    s = str(val)
+    if "[" in s and "]" in s:
         try:
-            r = requests.get(url, timeout=timeout)
-            if r.status_code == 200:
-                js = r.json()
-                if isinstance(js, dict) and "data" in js:
-                    return [m.get("id") for m in js["data"] if isinstance(m, dict)]
-                if isinstance(js, list):
-                    return [m.get("id", m) if isinstance(m, dict) else m for m in js]
+            arr = json.loads(s)
+            if isinstance(arr, list): return normalize_instructions(arr)
         except Exception:
             pass
-    return []
+    return split_lines(s)
 
-def resolve_model_id(requested: str, available: list) -> str:
-    if not available or requested in available:
-        return requested
-    import re
-    def norm(s): return re.sub(r"[^a-z0-9]+", "", s.lower())
-    nreq = norm(requested)
-    for a in available:
-        if norm(a) == nreq:
-            return a
-    for a in available:
-        if nreq in norm(a) or norm(a) in nreq:
-            return a
-    return available[0]
+def enumerate_candidates(instr_json_path: str) -> List[Tuple[str,int,List[str]]]:
+    if not os.path.exists(instr_json_path):
+        raise FileNotFoundError(f"Instructions JSON not found: {instr_json_path}")
+    with open(instr_json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    out: List[Tuple[str,int,List[str]]] = []
 
-def chat_completion(api_base: str,
-                    model: str,
-                    system_prompt: str,
-                    user_prompt: str,
-                    temperature: float,
-                    max_tokens: int,
-                    connect_timeout: float,
-                    read_timeout: float) -> str:
-    import requests
-    def _post_json(url, body):
-        return requests.post(
-            url, json=body,
-            headers={"Content-Type": "application/json"},
-            timeout=(connect_timeout, read_timeout),
+    if isinstance(data, dict) and isinstance(data.get("candidates"), list):
+        for i, cand in enumerate(data["candidates"]):
+            if not isinstance(cand, dict): continue
+            cid = None
+            for k in CAND_ID_COLS_JSON:
+                if k in cand and cand[k] is not None:
+                    cid = str(cand[k]).strip(); break
+            instr_raw = None
+            for k in INSTR_COLS_JSON:
+                if k in cand and cand[k] is not None:
+                    instr_raw = cand[k]; break
+            instr = normalize_instructions(instr_raw)
+            if instr: out.append((cid if cid is not None else str(i), i, instr))
+        return out
+
+    if isinstance(data, list):
+        for i, cand in enumerate(data):
+            if isinstance(cand, dict):
+                cid = None
+                for k in CAND_ID_COLS_JSON:
+                    if k in cand and cand[k] is not None:
+                        cid = str(cand[k]).strip(); break
+                instr_raw = None
+                for k in INSTR_COLS_JSON:
+                    if k in cand and cand[k] is not None:
+                        instr_raw = cand[k]; break
+                instr = normalize_instructions(instr_raw)
+                if instr: out.append((cid if cid is not None else str(i), i, instr))
+            elif isinstance(cand, str):
+                out.append((str(i), i, normalize_instructions(cand)))
+        return out
+
+    if isinstance(data, dict):
+        single = None
+        for k in INSTR_COLS_JSON:
+            if k in data and data[k] is not None:
+                single = normalize_instructions(data[k]); break
+        if single: out.append(("0", 0, single))
+        if isinstance(data.get("by_id"), dict):
+            for cid, obj in data["by_id"].items():
+                if not isinstance(obj, dict): continue
+                instr_raw = None
+                for k in INSTR_COLS_JSON:
+                    if k in obj and obj[k] is not None:
+                        instr_raw = obj[k]; break
+                instr = normalize_instructions(instr_raw)
+                if instr: out.append((str(cid), len(out), instr))
+        if isinstance(data.get("by_index"), list):
+            for i, obj in enumerate(data["by_index"]):
+                if not isinstance(obj, dict): continue
+                instr_raw = None
+                for k in INSTR_COLS_JSON:
+                    if k in obj and obj[k] is not None:
+                        instr_raw = obj[k]; break
+                instr = normalize_instructions(instr_raw)
+                if instr: out.append((str(i), i, instr))
+        seen=set(); dedup=[]
+        for cid,i,instr in out:
+            if cid in seen: continue
+            seen.add(cid); dedup.append((cid,i,instr))
+        return dedup
+
+    return out
+
+# ------------------------ ARC loading ------------------------
+
+def load_arc_task(arc_root: str, task_id: str) -> dict:
+    p = os.path.join(arc_root, f"{task_id}.json")
+    if os.path.exists(p):
+        with open(p, "r", encoding="utf-8") as f: return json.load(f)
+    hits = glob.glob(os.path.join(arc_root, "**", f"{task_id}.json"), recursive=True)
+    if not hits:
+        raise FileNotFoundError(f"ARC file not found for {task_id} under {arc_root}")
+    with open(sorted(hits)[0], "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def pick_train_shots(task_obj: dict, shots: int, seed: Optional[int]) -> List[dict]:
+    train = task_obj.get("train", []) or []
+    if seed is not None: random.seed(seed)
+    if shots <= 0 or shots >= len(train): return train
+    return random.sample(train, shots)
+
+# ------------------------ DSL discovery & prompts ------------------------
+
+def discover_dsl_ops(dsl_module: str) -> List[str]:
+    try:
+        mod = importlib.import_module(dsl_module)
+        ops = []
+        for name, fn in mod.__dict__.items():
+            if callable(fn) and name.startswith("dsl_"):
+                try:
+                    sig = str(inspect.signature(fn))
+                except Exception:
+                    sig = "(...)"
+                ops.append(f"{name}{sig}")
+        ops.sort()
+        return ops
+    except Exception as e:
+        log("WARN", f"Could not import DSL module '{dsl_module}': {e}")
+        return []
+
+def build_system_prompt(dsl_module: str, dsl_ops: List[str]) -> str:
+    op_list = "\n".join(f"- {s}" for s in dsl_ops) if dsl_ops else "- dsl_* primitives (see dsl_primitives.py)"
+    return (
+        "You are a precise code generator. Output ONLY valid Python source code—no explanations, "
+        "no markdown code fences.\n"
+        "You must produce a single self-contained module that:\n"
+        f"  1) begins with:  from {dsl_module} import *\n"
+        "  2) defines:      def transform(grid: List[List[int]]) -> List[List[int]]\n"
+        "  3) uses ONLY DSL primitives (functions whose names start with dsl_) to manipulate grids.\n"
+        "\n"
+        "STRICT RULES (CRITICAL):\n"
+        "- You may NOT compute sizes, shapes, masks, frames, quadrants, slices, or bounding boxes yourself.\n"
+        "- You may NOT index into grids (no grid[r][c], no slicing, no numpy; avoid any Subscript usage).\n"
+        "- You may NOT introduce new arrays except those returned by DSL ops.\n"
+        "- Control flow (for/if/while) is allowed to orchestrate DSL calls, but all grid manipulation must be via DSL ops.\n"
+        "- If you need a value, region, or mask, obtain it with a DSL op only.\n"
+        "\n"
+        "AVAILABLE DSL PRIMITIVES (subset):\n"
+        f"{op_list}\n"
+        "\n"
+        "Return ONLY Python source code for the module."
+    )
+
+def build_user_prompt(task_id: str, cand_id: str, instructions: List[str], train_shots: List[dict]) -> str:
+    instr_block = "\n".join(f"- {ln}" for ln in instructions) if instructions else "- <no instructions>"
+    ex_json = ""
+    if train_shots:
+        ex_json = json.dumps(
+            [{"input": ex["input"], "output": ex["output"]} for ex in train_shots if "input" in ex and "output" in ex],
+            ensure_ascii=False
         )
-    # Try Chat Completions
-    chat_url = f"{api_base.rstrip('/')}/v1/chat/completions"
-    chat_body = {
+    return (
+        f"Task ID: {task_id} | Candidate: {cand_id}\n"
+        "Write Python that performs a grid transformation **using only the DSL primitives**. "
+        "The module must start with `from dsl_primitives import *` (or the provided DSL module) and define:\n"
+        "    def transform(grid: List[List[int]]) -> List[List[int]]\n"
+        "Natural-language steps (apply in order):\n"
+        f"{instr_block}\n\n" +
+        (("Training examples the code MUST satisfy (JSON list of {input, output}):\n" + ex_json + "\n\n") if ex_json else "") +
+        "Generate ONLY the Python source code."
+    )
+
+# ------------------------ HTTP to vLLM ------------------------
+
+def post_chat_with_retries(url: str, headers: Dict[str,str], payload: Dict[str,Any],
+                           retries: int, base_timeout: float) -> Tuple[int, Any, float, Optional[str]]:
+    backoff = 0.8
+    last_err = None
+    for attempt in range(1, retries + 1):
+        t0 = time.time()
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=base_timeout)
+            latency = round(time.time() - t0, 3)
+            if r.status_code == 200:
+                try:
+                    return r.status_code, r.json(), latency, None
+                except Exception as e:
+                    return r.status_code, r.text, latency, f"json_decode_error: {e}"
+            body_head = (r.text or "")[:400]
+            last_err = f"HTTP {r.status_code}: {body_head}"
+            if r.status_code in (429, 500, 502, 503, 504) and attempt < retries:
+                ra = r.headers.get("Retry-After")
+                if ra:
+                    try: sleep_s = float(ra)
+                    except Exception: sleep_s = backoff * attempt
+                else:
+                    sleep_s = backoff * attempt
+                time.sleep(sleep_s + random.random() * 0.3)
+                continue
+        except Exception as e:
+            latency = round(time.time() - t0, 3)
+            last_err = repr(e)
+            if attempt < retries:
+                time.sleep(backoff * attempt + random.random() * 0.3)
+                continue
+        return (r.status_code if 'r' in locals() else 0), (r.text if 'r' in locals() else None), latency, last_err
+    return 0, None, 0.0, f"failed_after_retries: {last_err}"
+
+def chat_complete_parallel(api_base: str, api_key: str, model: str,
+    system_prompt: str, user_prompt: str,
+    temperature: float, max_tokens: int,
+    retries: int = 3, timeout: float = 120.0) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
+    url = f"{api_base.rstrip('/')}/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if api_key and api_key.strip() and api_key.strip().upper() != "EMPTY":
+        headers["Authorization"] = f"Bearer {api_key.strip()}"
+    payload: Dict[str, Any] = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": user_prompt},
-        ],
+        "messages": [{"role":"system","content":system_prompt},{"role":"user","content":user_prompt}],
         "temperature": temperature,
         "max_tokens": max_tokens,
-        "stop": STOP_SEQUENCES,
     }
-    r = _post_json(chat_url, chat_body)
-    if r.status_code in (404, 405):
-        # Fallback: Text Completions
-        comp_url = f"{api_base.rstrip('/')}/v1/completions"
-        prompt = f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}\n\nASSISTANT:\n"
-        comp_body = {
-            "model": model,
-            "prompt": prompt,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "stop": STOP_SEQUENCES,
-        }
-        r2 = _post_json(comp_url, comp_body)
-        try:
-            r2.raise_for_status()
-        except Exception:
-            raise RuntimeError(
-                f"Both endpoints failed. chat/completions={r.status_code} {r.text[:300]!r}; "
-                f"completions={r2.status_code} {r2.text[:300]!r}"
-            )
-        payload = r2.json()
-        return payload["choices"][0].get("text", "")
-    r.raise_for_status()
-    payload = r.json()
-    return payload["choices"][0]["message"]["content"]
+    status, body, latency, err = post_chat_with_retries(url, headers, payload, retries=retries, base_timeout=timeout)
+    meta = {"latency_s": latency, "status_code": status}
+    if isinstance(body, dict):
+        meta["usage"] = body.get("usage")
+        content = body.get("choices", [{}])[0].get("message", {}).get("content")
+        return content, meta, err
+    return None, meta, err
 
-# ============================ Worker ============================
+# ------------------------ extraction & repair ------------------------
 
-def _write(path: str, text: str) -> Optional[str]:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
-    return path
+def extract_python_source(text: str) -> str:
+    if text is None: return ""
+    t = text.strip()
+    # Prefer fenced block if present
+    m = re.search(r"```(?:python)?\s*([\s\S]*?)```", t, flags=re.IGNORECASE)
+    if m: return m.group(1).strip()
+    return t
 
-def process_candidate(idx: int,
-                      args,
-                      nl_text: str,
-                      io_pairs_for_prompt: List[Dict[str, Any]],
-                      allowed_ops: List[str],
-                      out_dir: str) -> Dict[str, Any]:
-    py_path = os.path.join(out_dir, f"{args.task_id}.cand_{idx}.transform.nl.py")
-    log_path = os.path.join(out_dir, f"{args.task_id}.cand_{idx}.log.json")
-    result = {"candidate": idx, "status": "unknown", "py_path": py_path}
+def repair_source(src: str, dsl_module: str) -> str:
+    if not src: return src
+
+    # strip any stray triple backticks without language
+    src = re.sub(r"^```+\s*$", "", src, flags=re.M)
+    src = re.sub(r"^```+\s*$", "", src[::-1], flags=re.M)[::-1]
+
+    # If it used alias import: "import dsl_primitives as dsl"
+    alias_pat = rf"^\s*import\s+{re.escape(dsl_module)}\s+as\s+dsl\s*$"
+    if re.search(alias_pat, src, flags=re.M):
+        src = re.sub(alias_pat, "", src, flags=re.M)
+        src = f"from {dsl_module} import *\n{src}"
+        # Rewrite dsl.dsl_foo(...) → dsl_foo(...)
+        src = re.sub(r"\bdsl\.(dsl_[A-Za-z0-9_]+)\b", r"\1", src)
+
+    # If first non-empty line isn’t an import, prepend the DSL import
+    lines = [ln for ln in src.splitlines() if ln.strip()]
+    if not lines or not lines[0].lstrip().startswith(("from ", "import ")):
+        src = f"from {dsl_module} import *\n\n{src}"
+
+    return src
+
+# ------------------------ validation ------------------------
+
+def validate_python_module_basic(src: str) -> Optional[str]:
+    try:
+        ast.parse(src)
+    except SyntaxError as e:
+        return f"SyntaxError: {e}"
+    tree = ast.parse(src)
+    if not any(isinstance(n, ast.FunctionDef) and n.name == "transform" for n in tree.body):
+        return "No function named 'transform' found."
+    return None
+
+def validate_dsl_only(src: str, dsl_module: str, allow_calls: Set[str], strict: bool) -> Optional[str]:
+    """
+    Relaxed by default: requires a DSL import, a transform(), and at least one dsl_* call.
+    In --strict-dsl mode: also bans direct Subscript and non-DSL calls inside transform.
+    """
+    try:
+        tree = ast.parse(src)
+    except SyntaxError as e:
+        return f"SyntaxError: {e}"
+
+    # 1) must import DSL somewhere
+    has_dsl_import = False
+    for n in tree.body:
+        if isinstance(n, ast.ImportFrom) and n.module == dsl_module:
+            has_dsl_import = True; break
+    if not has_dsl_import:
+        return f"Missing 'from {dsl_module} import *' (or equivalent) at top-level."
+
+    # 2) find transform
+    fn = next((n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "transform"), None)
+    if fn is None:
+        return "Missing transform() definition."
+
+    # 3) count dsl calls & optionally enforce strictness
+    dsl_calls = 0
+
+    class V(ast.NodeVisitor):
+        def visit_Call(self, node: ast.Call):
+            nonlocal dsl_calls
+            fnname = None
+            if isinstance(node.func, ast.Name):
+                fnname = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                # accept attribute if attr starts with dsl_
+                if getattr(node.func, "attr", "").startswith("dsl_"):
+                    fnname = node.func.attr
+            if fnname and fnname.startswith("dsl_"):
+                dsl_calls += 1
+            elif fnname and fnname in allow_calls:
+                pass
+            elif strict:
+                raise RuntimeError(f"Call to non-DSL function '{fnname}' is not allowed in --strict-dsl mode.")
+            self.generic_visit(node)
+
+        def visit_Subscript(self, node: ast.Subscript):
+            if strict:
+                raise RuntimeError("Forbidden direct indexing/slicing in --strict-dsl mode; use DSL ops only.")
+            self.generic_visit(node)
 
     try:
-        sys_prompt = build_system_prompt()
-        usr_prompt = build_user_prompt(nl_text, io_pairs_for_prompt, allowed_ops)
+        V().visit(fn)
+    except RuntimeError as e:
+        return str(e)
 
-        # 1) Generate code
-        raw = chat_completion(
-            api_base=args.api_base,
-            model=args.model,
-            system_prompt=sys_prompt,
-            user_prompt=usr_prompt,
-            temperature=args.temperature,
-            max_tokens=args.max_tokens,
-            connect_timeout=args.http_connect_timeout,
-            read_timeout=args.http_read_timeout,
-        )
-        code = coerce_to_valid_file(raw)
+    if dsl_calls == 0:
+        return "No DSL calls found; program must use at least one dsl_* primitive."
+    return None
 
-        # 2) Pre-flight checks
-        err = static_checks(code, allowed_ops)
-        if err:
-            # 3) Auto-repair once
-            repair_prompt = build_repair_prompt(code, err)
-            raw2 = chat_completion(
-                api_base=args.api_base,
-                model=args.model,
-                system_prompt=sys_prompt,
-                user_prompt=repair_prompt,
-                temperature=min(args.temperature + 0.1, 0.7),
-                max_tokens=args.max_tokens,
-                connect_timeout=args.http_connect_timeout,
-                read_timeout=args.http_read_timeout,
-            )
-            code2 = coerce_to_valid_file(raw2)
-            err2 = static_checks(code2, allowed_ops)
-            if err2:
-                result["status"] = "invalid_code"
-                result["error"] = f"Pre-flight failed after repair: {err2}"
-                _write(py_path, code2)
-                _write(log_path, json.dumps(result, indent=2))
-                return result
-            code = code2
-
-        # 4) Write & smoke test
-        _write(py_path, code)
-        rterr = runtime_smoke(py_path)
-        if rterr:
-            # one more chance: repair with runtime error
-            repair_prompt = build_repair_prompt(code, rterr)
-            raw3 = chat_completion(
-                api_base=args.api_base,
-                model=args.model,
-                system_prompt=sys_prompt,
-                user_prompt=repair_prompt,
-                temperature=min(args.temperature + 0.1, 0.7),
-                max_tokens=args.max_tokens,
-                connect_timeout=args.http_connect_timeout,
-                read_timeout=args.http_read_timeout,
-            )
-            code3 = coerce_to_valid_file(raw3)
-            _write(py_path, code3)
-            err3 = static_checks(code3, allowed_ops)
-            if err3:
-                result["status"] = "runtime_error"
-                result["error"] = f"Runtime failed after repair: {err3}"
-                _write(log_path, json.dumps(result, indent=2))
-                return result
-            rterr2 = runtime_smoke(py_path)
-            if rterr2:
-                result["status"] = "runtime_error"
-                result["error"] = f"Runtime failed after repair: {rterr2}"
-                _write(log_path, json.dumps(result, indent=2))
-                return result
-
-        result["status"] = "ok"
-        _write(log_path, json.dumps(result, indent=2))
-        return result
-
-    except Exception as e:
-        result["status"] = "api_or_unexpected_error"
-        result["error"] = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
-        _write(log_path, json.dumps(result, indent=2))
-        return result
-
-# ============================ Main ============================
+# ------------------------ main ------------------------
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--scores-root", required=True)
-    p.add_argument("--task-id", required=True)
-    p.add_argument("--instr-json", required=True, help="Path to NL candidates JSON (and/or ARC IO pairs)")
-    p.add_argument("--api-base", required=True)
-    p.add_argument("--model", required=True)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--scores-root", required=True)
+    ap.add_argument("--task-id", required=True)
+    ap.add_argument("--instr-json", required=True)
+    ap.add_argument("--arc-root", default=None)
+    ap.add_argument("--shots", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=None)
 
-    # Concurrency & decoding
-    p.add_argument("--workers", type=int, default=8)
-    p.add_argument("--temperature", type=float, default=0.35)
-    p.add_argument("--max-tokens", type=int, default=400)
+    ap.add_argument("--api-base", default=os.environ.get("OPENAI_API_BASE","http://127.0.0.1:8000/v1"))
+    ap.add_argument("--api-key",  default=os.environ.get("OPENAI_API_KEY",""))
+    ap.add_argument("--model",    default=os.environ.get("LLM_MODEL","llama-3.1-8b-instruct"))
+    ap.add_argument("--temperature", type=float, default=0.05)
+    ap.add_argument("--max-tokens",  type=int, default=1600)
+    ap.add_argument("--retries",     type=int, default=3)
+    ap.add_argument("--timeout",     type=float, default=120.0)
 
-    # HTTP timeouts
-    p.add_argument("--http-connect-timeout", type=float, default=10.0)
-    p.add_argument("--http-read-timeout", type=float, default=600.0)
+    # Use a module (e.g., dsl_primitives) that exposes dsl_* functions
+    ap.add_argument("--dsl-module",  default="dsl_primitives",
+                    help="Python module that exposes dsl_* primitives (e.g., dsl_primitives)")
 
-    # Allowlist override (comma-separated)
-    p.add_argument("--allowed-ops", default=",".join(DEFAULT_ALLOWED_OPS))
+    # Strictness
+    ap.add_argument("--strict-dsl", action="store_true",
+                    help="Fail candidates that use Subscript or non-DSL calls inside transform(). Default: relaxed.")
 
-    # Candidate cap (optional)
-    p.add_argument("--max-candidates", type=int, default=None)
+    # Parallelism
+    default_workers = min(max(6, (os.cpu_count() or 4) * 2), 16)
+    ap.add_argument("--workers", type=int, default=default_workers)
 
-    args = p.parse_args()
+    # Telemetry/printing
+    ap.add_argument("--emit-events", action="store_true")
+    ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--print-full-module", action="store_true",
+                    help="Print full module (default prints only transform()).")
+    ap.add_argument("--no-print", action="store_true", help="Don’t print any code.")
 
-    # Load input JSON
-    with open(args.instr_json, "r", encoding="utf-8") as f:
-        blob = json.load(f)
+    args = ap.parse_args()
 
-    nl_list = extract_nl_candidates(blob)
-    io_pairs = extract_io_pairs(blob)[:2]  # keep prompt short
+    task_dir = os.path.join(args.scores_root, f"{args.task_id}_allc_out")
+    os.makedirs(task_dir, exist_ok=True)
 
-    if not nl_list:
-        print("[FATAL] No NL instruction candidates found. Expected {'candidates':[{'instructions': ...}]} or a list of such dicts.", file=sys.stderr)
-        sys.exit(2)
-    if args.max_candidates is not None:
-        nl_list = nl_list[: args.max_candidates]
+    # Discover DSL ops to show the model
+    dsl_ops = discover_dsl_ops(args.dsl_module)
+    sys_prompt = build_system_prompt(args.dsl_module, dsl_ops)
 
-    # Resolve model id if the server has a slightly different name
-    avail = list_models(args.api_base)
-    if avail:
-        resolved = resolve_model_id(args.model, avail)
-        if resolved != args.model:
-            print(f"[INFO] Model '{args.model}' not found; using '{resolved}' from server list: {avail}")
-            args.model = resolved
-    else:
-        print("[WARN] Could not list models from server; proceeding with requested id:", args.model)
+    tel = Telemetry(scores_root=args.scores_root, emit_events=args.emit_events)
+    tel.rollup.update({
+        "task_id": args.task_id, "api_base": args.api_base, "model": args.model,
+        "temperature": args.temperature, "max_tokens": args.max_tokens, "workers": args.workers,
+    })
 
-    allowed_ops = [x.strip() for x in args.allowed_ops.split(",") if x.strip()]
-    out_dir = os.path.join(args.scores_root, f"{args.task_id}_allc_out")
-    os.makedirs(out_dir, exist_ok=True)
+    # Preflight /models (warn-only)
+    try:
+        import urllib.request
+        models_url = args.api_base.rstrip("/") + "/models"
+        req = urllib.request.Request(models_url)
+        if args.api_key and args.api_key.strip():
+            req.add_header("Authorization", f"Bearer {args.api_key.strip()}")
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        avail = {m.get("id") for m in (data.get("data") or []) if isinstance(m, dict)}
+        if avail and args.model not in avail:
+            log("WARN", f"Model '{args.model}' not served at {models_url}. Available: {sorted(list(avail))[:8]}…")
+    except Exception as e:
+        log("WARN", f"Preflight /models failed: {e} (continuing)")
 
-    print(f"[INFO] Task {args.task_id}: {len(nl_list)} candidate(s); workers={args.workers}")
-    print(f"[INFO] Using {len(io_pairs)} IO pair(s) for reference in prompt.")
-    print(f"[INFO] Allowed ops: {', '.join(allowed_ops)}")
+    try:
+        candidates = enumerate_candidates(args.instr_json)
+    except Exception as e:
+        log("ERROR", f"Failed to enumerate candidates: {e}")
+        tel.rollup["notes"].append(f"enumerate_error:{e}")
+        tel.end(); sys.exit(1)
+    if not candidates:
+        log("ERROR", "No instruction candidates found.")
+        tel.rollup["notes"].append("no_candidates")
+        tel.end(); sys.exit(1)
 
-    # Run in parallel
-    results: List[Dict[str, Any]] = []
-    with cf.ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futs = [
-            ex.submit(process_candidate, i, args, nl_list[i], io_pairs, allowed_ops, out_dir)
-            for i in range(len(nl_list))
-        ]
-        for f in cf.as_completed(futs):
-            r = f.result()
-            results.append(r)
-            print("=" * 75)
-            print(f"[RESULT] Task {args.task_id} | Candidate {r.get('candidate')} | status={r.get('status')}")
-            if r.get("status") == "ok":
-                print(f"Python: {r['py_path']}")
+    if args.seed is not None:
+        random.seed(args.seed)
+        candidates = sorted(candidates, key=lambda x: x[0])
+
+    tel.rollup["candidates_total"] = len(candidates)
+    log("INFO", f"Task {args.task_id}: {len(candidates)} candidate(s); workers={args.workers}")
+
+    train_shots: List[dict] = []
+    if args.arc_root:
+        try:
+            task_obj = load_arc_task(args.arc_root, args.task_id)
+            train_shots = pick_train_shots(task_obj, args.shots, args.seed) if args.shots else []
+            log("INFO", f"Using {len(train_shots)} ARC training shot(s) in prompt.")
+        except Exception as e:
+            log("WARN", f"ARC examples unavailable: {e}")
+
+    print_lock = threading.Lock()
+
+    def process_candidate(cand: Tuple[str,int,List[str]]) -> Dict[str, Any]:
+        cand_id, cand_idx, instructions = cand
+        cand_key = f"{cand_id}" if cand_id is not None else str(cand_idx)
+        out_py = os.path.join(task_dir, f"{args.task_id}.cand_{cand_key}.transform.nl.py")
+        tel_json = os.path.join(task_dir, f"{args.task_id}.cand_{cand_key}.nl_gen.telemetry.json")
+        per_tel: Dict[str, Any] = {
+            "task_id": args.task_id, "candidate_id": cand_key, "candidate_index": cand_idx,
+            "instr_json": args.instr_json, "out_py": out_py,
+            "status": "init", "latency_s": None, "llm": {}, "prompt_bytes": {}, "generated_code": None,
+        }
+        try:
+            user_prompt = build_user_prompt(args.task_id, cand_key, instructions, train_shots)
+            per_tel["prompt_bytes"] = {
+                "system": len(sys_prompt.encode("utf-8")),
+                "user": len(user_prompt.encode("utf-8")),
+                "n_instructions": len(instructions),
+                "shots": len(train_shots),
+            }
+            tel.event("llm.request", task_id=args.task_id, candidate=cand_key)
+            content, meta, err = chat_complete_parallel(
+                api_base=args.api_base, api_key=args.api_key, model=args.model,
+                system_prompt=sys_prompt, user_prompt=user_prompt,
+                temperature=args.temperature, max_tokens=args.max_tokens,
+                retries=args.retries, timeout=args.timeout,
+            )
+            per_tel["llm"] = meta
+            per_tel["latency_s"] = meta.get("latency_s")
+            src_code = extract_python_source(content or "")
+            src_code = repair_source(src_code, args.dsl_module)
+            per_tel["generated_code"] = src_code
+
+            # Validation
+            v_err = validate_python_module_basic(src_code)
+            if not v_err:
+                v_err = validate_dsl_only(src_code, dsl_module=args.dsl_module,
+                                          allow_calls=SAFE_BUILTIN_CALLS, strict=args.strict_dsl)
+
+            if v_err:
+                per_tel["status"] = "invalid_code"; per_tel["error"] = v_err
+                tel.event("candidate.error", task_id=args.task_id, candidate=cand_key, error=v_err)
+                # save sidecar for debugging
+                try:
+                    with open(out_py.replace(".py", ".invalid.txt"), "w", encoding="utf-8") as fe:
+                        fe.write(v_err + "\n\n" + src_code)
+                except Exception:
+                    pass
             else:
-                print(json.dumps(r, indent=2))
+                with open(out_py, "w", encoding="utf-8") as f:
+                    f.write(src_code)
+                per_tel["status"] = "ok"
+                tel.event("candidate.ok", task_id=args.task_id, candidate=cand_key, out_py=out_py)
+
+            # Print a banner per candidate unless --no-print
+            if not args.no_print:
+                banner = "=" * 80
+                with print_lock:
+                    print(f"\n{banner}\n[CODE] Task {args.task_id} | Candidate {cand_key} | status={per_tel['status']}\nPath: {out_py}\n{banner}", flush=True)
+                    code_to_show = src_code or "# <empty model response>"
+                    # Show only transform() for brevity
+                    try:
+                        tree = ast.parse(code_to_show)
+                        fn = None
+                        for n in tree.body:
+                            if isinstance(n, ast.FunctionDef) and n.name == "transform":
+                                fn = n; break
+                        if fn and getattr(fn, "end_lineno", None) is not None:
+                            lines = code_to_show.splitlines()
+                            start = max(0, fn.lineno-1); end = min(len(lines), fn.end_lineno)
+                            print("\n".join(lines[start:end]), flush=True)
+                        else:
+                            print(code_to_show, flush=True)
+                    except Exception:
+                        print(code_to_show, flush=True)
+                    print(f"{banner}\n", flush=True)
+
+            if args.verbose:
+                log("INFO", f"candidate {cand_key} done: {per_tel.get('status')} {per_tel.get('error','')}")
+
+        except Exception as e:
+            per_tel["status"] = "exception"; per_tel["error"] = repr(e)
+            tel.event("candidate.exception", task_id=args.task_id, candidate=cand_key, error=repr(e))
+            if not args.no_print:
+                with print_lock:
+                    print(f"\n{'='*80}\n[CODE] Task {args.task_id} | Candidate {cand_key} | status=exception\n{e}\n{'='*80}\n", flush=True)
+        try:
+            with open(tel_json, "w", encoding="utf-8") as f:
+                json.dump(per_tel, f, indent=2)
+        except Exception:
+            pass
+        return per_tel
+
+    results: List[Dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        futs = [pool.submit(process_candidate, cand) for cand in candidates]
+        for fut in as_completed(futs):
+            per = fut.result()
+            results.append(per)
+            if per.get("status") == "ok":
+                tel.rollup["candidates_ok"] += 1
+            else:
+                tel.rollup["candidates_err"] += 1
+
+    tel.end()
+    log("INFO", f"Telemetry summary: {tel.summary_path}")
 
 if __name__ == "__main__":
     main()
