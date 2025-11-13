@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 from __future__ import annotations
@@ -222,7 +223,7 @@ def build_system_prompt(dsl_module: str, dsl_ops: List[str]) -> str:
         "Return ONLY Python source code for the module."
     )
 
-def build_user_prompt(task_id: str, cand_id: str, instructions: List[str], train_shots: List[dict]) -> str:
+def build_user_prompt(task_id: str, cand_id: str, instructions: List[str], train_shots: List[dict], feedback_text: str = "") -> str:
     instr_block = "\n".join(f"- {ln}" for ln in instructions) if instructions else "- <no instructions>"
     ex_json = ""
     if train_shots:
@@ -230,16 +231,22 @@ def build_user_prompt(task_id: str, cand_id: str, instructions: List[str], train
             [{"input": ex["input"], "output": ex["output"]} for ex in train_shots if "input" in ex and "output" in ex],
             ensure_ascii=False
         )
+    fb = ""
+    if feedback_text.strip():
+        fb = "\n\nPrevious errors to avoid (critical):\n" + feedback_text.strip() + "\n"
+
     return (
         f"Task ID: {task_id} | Candidate: {cand_id}\n"
         "Write Python that performs a grid transformation **using only the DSL primitives**. "
-        "The module must start with `from dsl_primitives import *` (or the provided DSL module) and define:\n"
-        "    def transform(grid: List[List[int]]) -> List[List[int]]\n"
+        "The module must start with from dsl_primitives import * and define:\n"
+        " def transform(grid: List[List[int]]) -> List[List[int]]\n"
         "Natural-language steps (apply in order):\n"
-        f"{instr_block}\n\n" +
-        (("Training examples the code MUST satisfy (JSON list of {input, output}):\n" + ex_json + "\n\n") if ex_json else "") +
+        f"{instr_block}\n\n"
+        + (("Training examples the code MUST satisfy (JSON list of {input, output}):\n" + ex_json + "\n\n") if ex_json else "")
+        + fb +
         "Generate ONLY the Python source code."
     )
+
 
 # ------------------------ HTTP to vLLM ------------------------
 
@@ -438,6 +445,10 @@ def main():
     ap.add_argument("--print-full-module", action="store_true",
                     help="Print full module (default prints only transform()).")
     ap.add_argument("--no-print", action="store_true", help="Don’t print any code.")
+    # in main(), after other argparse adds:
+    ap.add_argument("--feedback-file", default=None,
+                    help="Optional path to a text file of prior errors/hints to avoid; added to the user prompt")
+
 
     args = ap.parse_args()
 
@@ -509,7 +520,21 @@ def main():
             "status": "init", "latency_s": None, "llm": {}, "prompt_bytes": {}, "generated_code": None,
         }
         try:
-            user_prompt = build_user_prompt(args.task_id, cand_key, instructions, train_shots)
+            feedback_text = ""
+            if getattr(args, "feedback_file", None):
+                try:
+                    with open(args.feedback_file, "r", encoding="utf-8") as _fb:
+                        feedback_text = _fb.read()
+                except Exception:
+                    feedback_text = ""
+
+            user_prompt = build_user_prompt(
+                args.task_id,
+                cand_key,
+                instructions,
+                train_shots,
+                feedback_text,  # <-- new arg
+            )
             per_tel["prompt_bytes"] = {
                 "system": len(sys_prompt.encode("utf-8")),
                 "user": len(user_prompt.encode("utf-8")),
@@ -605,3 +630,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
